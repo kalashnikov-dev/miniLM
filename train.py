@@ -1,5 +1,6 @@
 from transformers import AutoTokenizer
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torchtune.modules import RotaryPositionalEmbeddings
 
@@ -15,7 +16,7 @@ tokens = tokenizer.encode(training_data)
 #hyperparameters
 vocab_size = tokenizer.vocab_size
 batch_size = 2
-batch_len = 15
+seq_len = 15
 context_len = 2048
 d_model = 576
 d_head = 64
@@ -23,32 +24,46 @@ n_heads = 9 # d_model / d_head
 
 
 #embedding
-lm_head = torch.nn.Embedding(vocab_size, d_model)
+lm_head = nn.Embedding(vocab_size, d_model)
 x = lm_head(torch.tensor(tokens))
 
-#attention
-q = torch.nn.Linear(d_model, d_head * n_heads)
-k = torch.nn.Linear(d_model, d_head * n_heads)
-v = torch.nn.Linear(d_model, d_head * n_heads)
+#pre attention normalization
+atn_norm = nn.RMSNorm(d_model) # https://docs.pytorch.org/docs/2.13/generated/torch.nn.RMSNorm.html
+x_norm = atn_norm(x)
 
-Q = q(x).view(batch_size, batch_len, n_heads, d_head)
-K = k(x).view(batch_size, batch_len, n_heads, d_head)
-V = v(x).view(batch_size, batch_len, n_heads, d_head)
-print(Q.shape)
+
+#attention
+q = nn.Linear(d_model, d_head * n_heads, bias = False)
+k = nn.Linear(d_model, d_head * n_heads, bias = False)
+v = nn.Linear(d_model, d_head * n_heads, bias = False)
+o = nn.Linear(d_model, d_model, bias = False)
+
+Q = q(x_norm).view(batch_size, seq_len, n_heads, d_head)
+K = k(x_norm).view(batch_size, seq_len, n_heads, d_head)
+V = v(x_norm).view(batch_size, seq_len, n_heads, d_head)
+
+#positional encoding
 rope = RotaryPositionalEmbeddings(dim = d_head, max_seq_len = context_len) # https://meta-pytorch.org/torchtune/stable/generated/torchtune.modules.RotaryPositionalEmbeddings.html?highlight=rope
 
 Q_rotated = rope(Q)
 K_rotated = rope(K)
 
-Q_rotated = Q_rotated.transpose(1, 2)
-K_rotated = K_rotated.transpose(1, 2)
-V = V.transpose(1, 2)
-print(Q_rotated.shape)
-
-x = F.scaled_dot_product_attention(Q_rotated, K_rotated, V, is_causal = True) #  https://docs.pytorch.org/docs/2.13/generated/torch.nn.functional.scaled_dot_product_attention.html
+x_atn = F.scaled_dot_product_attention(
+    Q_rotated.transpose(1, 2), K_rotated.transpose(1, 2), V.transpose(1, 2), is_causal = True) #  https://docs.pytorch.org/docs/2.13/generated/torch.nn.functional.scaled_dot_product_attention.html
 #enable_gqa = True
 
+x_atn = x_atn.transpose(1, 2).view(batch_size, seq_len, d_head * n_heads)
+x_atn = o(x_atn)
 
-print(x.shape)
+#residual conn
+x = x + x_atn
+print(x[0, 0, :10])
+
+#pre-FF normalization
+ff_norm = nn.RMSNorm(d_model)
+x_norm = ff_norm(x)
+print(x_norm[0, 0, :10])
+
+
 
 
