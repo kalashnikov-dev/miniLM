@@ -7,11 +7,11 @@ from torchtune.modules import RotaryPositionalEmbeddings
 
 #data
 training_data = ["Hello, I'm a language model and I'm going to generate a text",
-                 "Hello, I'm a language model and I'm going to code really nice"]
-
+                 "Hello, I'm a language model and I'm going to code really good"]
 #tokenization
 tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
 tokens = tokenizer.encode(training_data)
+tokens = torch.tensor(tokens)
 
 #hyperparameters
 vocab_size = tokenizer.vocab_size
@@ -19,13 +19,15 @@ batch_size = 2
 seq_len = 15
 context_len = 2048
 d_model = 576
+d_ff = int(d_model * 8/3)
 d_head = 64
 n_heads = 9 # d_model / d_head
 
 
+
 #embedding
 lm_head = nn.Embedding(vocab_size, d_model)
-x = lm_head(torch.tensor(tokens))
+x = lm_head(tokens)
 
 #pre attention normalization
 atn_norm = nn.RMSNorm(d_model) # https://docs.pytorch.org/docs/2.13/generated/torch.nn.RMSNorm.html
@@ -57,12 +59,37 @@ x_atn = o(x_atn)
 
 #residual conn
 x = x + x_atn
-print(x[0, 0, :10])
 
 #pre-FF normalization
-ff_norm = nn.RMSNorm(d_model)
-x_norm = ff_norm(x)
-print(x_norm[0, 0, :10])
+pre_ff_norm = nn.RMSNorm(d_model)
+x_norm = pre_ff_norm(x)
+
+w1 = nn.Linear(d_model, d_ff, bias = False)
+w2 = nn.Linear(d_ff, d_model, bias = False)
+w3 = nn.Linear(d_model, d_ff, bias = False)
+
+swiglu = w2(w1(x_norm) * F.silu(w3(x_norm)))
+
+x = x + swiglu
+
+
+#post-FF normalization
+post_ff_norm = nn.RMSNorm(d_model)
+x = post_ff_norm(x)
+
+#output
+logits = x @ lm_head.weight.transpose(0,1)
+
+#loss
+preds = logits[:, :-1, :]
+targets = tokens[:, 1:]
+
+loss = F.cross_entropy(preds.reshape(-1, vocab_size), targets.reshape(-1)) # https://docs.pytorch.org/docs/2.13/generated/torch.nn.functional.cross_entropy.html
+print(loss)
+
+#backward pass
+loss.backward()
+
 
 
 
