@@ -5,49 +5,70 @@ import torch.nn.functional as F
 from torchtune.modules import RotaryPositionalEmbeddings
 import math
 from datasets import load_dataset
+from torch.utils.data import IterableDataset, DataLoader
 import time
 from torch.optim.lr_scheduler import LambdaLR
 import storage
+from liger_kernel.transformers.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 torch.set_float32_matmul_precision('high')
+repo_id = "kalashnikov-dev/miniLM"
 
 
 tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
 
 
 vocab_size = len(tokenizer)
-batch_size = 1
+batch_size = 16
 seq_len = 2048
-d_model = 576
-d_ff = int(d_model * 8/3)
+d_model = 768
+d_ff = int(d_model * 8/3) # 2048
 d_head = 64
-n_heads = 9 # d_model / d_head
-n_layers = 30
-accumulation_steps = 128
-total_steps = 100
+n_heads = 12 
+n_kv_heads = 4
+n_layers = 16
+lr = 2e-3
+accumulation_steps = 8
+total_steps = 115000
 total_micro_steps = total_steps * accumulation_steps
-warmup_steps = int(total_steps * 0.1)
-decay_steps = int(total_steps * 0.2)
-repo_id = "kalashnikov-dev/miniLM"
+warmup_steps = 2000
+decay_steps = int(total_steps * 0.20)
+stable_end = total_steps - decay_steps 
+
 
 
 
 class TransformerBlock(nn.Module):
 
-
     def __init__(self):
         super().__init__()
-        self.atn_norm = nn.RMSNorm(d_model) # https://docs.pytorch.org/docs/2.13/generated/torch.nn.RMSNorm.html
+        self.atn_norm = nn.RMSNorm(d_model, eps=1e-5) # https://docs.pytorch.org/docs/2.13/generated/torch.nn.RMSNorm.html, eps for bfloat stability
         self.q = nn.Linear(d_model, d_head * n_heads, bias = False)
-        self.k = nn.Linear(d_model, d_head * n_heads, bias = False)
-        self.v = nn.Linear(d_model, d_head * n_heads, bias = False)
+        self.k = nn.Linear(d_model, d_head * n_kv_heads, bias = False)
+        self.v = nn.Linear(d_model, d_head * n_kv_heads, bias = False)
         self.o = nn.Linear(d_model, d_model, bias = False)
-        self.pre_ff_norm = nn.RMSNorm(d_model)
+
+        self.q_norm = nn.RMSNorm(d_head, eps=1e-5)
+        self.k_norm = nn.RMSNorm(d_head, eps=1e-5) 
+        self.pre_ff_norm = nn.RMSNorm(d_model, eps=1e-5)
+
         self.w1 = nn.Linear(d_model, d_ff, bias = False)
         self.w2 = nn.Linear(d_ff, d_model, bias = False)
         self.w3 = nn.Linear(d_model, d_ff, bias = False)
+
+        std = 0.02
+        nn.init.normal_(self.q.weight, mean=0.0, std=std)
+        nn.init.normal_(self.k.weight, mean=0.0, std=std)
+        nn.init.normal_(self.v.weight, mean=0.0, std=std)
+        nn.init.normal_(self.w1.weight, mean=0.0, std=std)
+        nn.init.normal_(self.w3.weight, mean=0.0, std=std)
+
+        scaled_std = std / math.sqrt(2 * n_layers) # for residual projections 
+        nn.init.normal_(self.o.weight, mean=0.0, std=scaled_std)
+        nn.init.normal_(self.w2.weight, mean=0.0, std=scaled_std)
 
 
     def forward(self, x, rope):
@@ -55,18 +76,17 @@ class TransformerBlock(nn.Module):
 
         x_norm = self.atn_norm(x)
 
-        Q = self.q(x_norm).view(b, s, n_heads, d_head)
-        K = self.k(x_norm).view(b, s, n_heads, d_head)
-        V = self.v(x_norm).view(b, s, n_heads, d_head)
+        Q = self.q_norm(self.q(x_norm).view(b, s, n_heads, d_head))
+        K = self.k_norm(self.k(x_norm).view(b, s, n_kv_heads, d_head))
+        V = self.v(x_norm).view(b, s, n_kv_heads, d_head)
 
         Q_rotated = rope(Q)
         K_rotated = rope(K)
 
         x_atn = F.scaled_dot_product_attention(
-            Q_rotated.transpose(1, 2), K_rotated.transpose(1, 2), V.transpose(1, 2), is_causal = True) #  https://docs.pytorch.org/docs/2.13/generated/torch.nn.functional.scaled_dot_product_attention.html
-        #enable_gqa = True
+            Q_rotated.transpose(1, 2), K_rotated.transpose(1, 2), V.transpose(1, 2), is_causal = True, enable_gqa = True) #  https://docs.pytorch.org/docs/2.13/generated/torch.nn.functional.scaled_dot_product_attention.html
 
-        x_atn = self.o(x_atn.transpose(1, 2).view(b, s, d_head * n_heads))
+        x_atn = self.o(x_atn.transpose(1, 2).reshape(b, s, d_head * n_heads))
 
         x = x + x_atn
 
@@ -81,14 +101,14 @@ class TransformerBlock(nn.Module):
 
 class Model(nn.Module):
 
-
     def __init__(self):
         super().__init__()
         self.lm_head = nn.Embedding(vocab_size, d_model)
-        nn.init.normal_(self.lm_head.weight, mean=0.0, std=(1/math.sqrt(d_model)))
         self.rope = RotaryPositionalEmbeddings(dim = d_head, max_seq_len = seq_len+1) # https://meta-pytorch.org/torchtune/stable/generated/torchtune.modules.RotaryPositionalEmbeddings.html?highlight=rope
-        self.post_ff_norm = nn.RMSNorm(d_model)
+        self.post_ff_norm = nn.RMSNorm(d_model, eps=1e-5)
         self.ff = nn.ModuleList([TransformerBlock() for _ in range(n_layers)])
+
+        nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
 
 
     def forward(self, tokens):
@@ -99,119 +119,123 @@ class Model(nn.Module):
 
         x = self.post_ff_norm(x)
 
-        logits = x @ self.lm_head.weight.transpose(0,1)
+        return x
 
-        return logits
+
+
+
+class StreamingDataset(IterableDataset):
+    def __init__(self, stream):
+        self.stream = stream
+
+    def __iter__(self):
+        buf = []
+        batch = []
+        for x in self.stream:
+            tokens = tokenizer.encode(x["text"], add_special_tokens=False)
+            buf.extend(tokens)
+            buf.append(tokenizer.eos_token_id)
+            
+            while len(buf) >= seq_len + 1:
+                chunk = buf[:seq_len + 1]
+                buf = buf[seq_len:]
+                batch.append(torch.tensor(chunk))
+
+                if len(batch) == batch_size:
+                    yield torch.stack(batch)
+                    batch = []
+
+    def state_dict(self):
+        return self.stream.state_dict()
+    def load_state_dict(self, sd):
+        self.stream.load_state_dict(sd)
 
 
 
 def get_lr_multiplier(step):
     if step < warmup_steps:
-        return (step+1) / warmup_steps # first stop is nonzero due to +1
-    
-    elif step < total_steps - decay_steps:
+        return (step + 1) / warmup_steps
+    if step < stable_end:
         return 1.0
-
-    else: 
-        decay_step = step - (total_steps - decay_steps)
-        return 1.0 - (decay_step / decay_steps)
+    p = min((step - stable_end) / decay_steps, 1.0)
+    return max(0.0, 1.0 - math.sqrt(p))
 
 
-raw_model = Model().to(device)   
-optimizer = torch.optim.AdamW(raw_model.parameters(), fused = True)
+raw_model = Model().to(device)
+
+decay_params = [p for p in raw_model.parameters() if p.requires_grad and p.dim() >= 2]
+no_decay_params = [p for p in raw_model.parameters() if p.requires_grad and p.dim() < 2]
+
+optimizer = torch.optim.AdamW(
+    [{'params': decay_params, 'weight_decay': 0.1},{'params': no_decay_params, 'weight_decay': 0.0}],
+    lr=lr, betas=(0.9, 0.95), eps=1e-8, fused=True
+)
 scheduler = LambdaLR(optimizer, lr_lambda=get_lr_multiplier)
+fused_ce = LigerFusedLinearCrossEntropyLoss()
+
+resume_micro_step = 0
+loader_state = None
+checkpoint = storage.load_checkpoint(device)
+if checkpoint:
+    raw_model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    resume_step = checkpoint['step']
+    loader_state = checkpoint['loader_state']
+    resume_micro_step = resume_step * accumulation_steps
+
+    print(f"loaded checkpoint {resume_step}")
+
+
+stream = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-100BT", 
+    split="train", streaming=True).shuffle(seed=1337, buffer_size=10_000)
+
+dataset = StreamingDataset(stream)
+dataloader = StatefulDataLoader(dataset, batch_size=None, num_workers=2, prefetch_factor=4, pin_memory=True)
+if loader_state is not None:
+    dataloader.load_state_dict(loader_state)
+
 model = torch.compile(raw_model)
 
-stream = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train", streaming=True)
 
-
-def get_batch(stream):
-    buf = []
-    batch = []
-
-    for x in stream:
-        tokens = tokenizer.encode(x["text"], add_special_tokens=False)
-        buf.extend(tokens)
-        buf.append(tokenizer.eos_token_id)
-        
-        while len(buf) >= seq_len+1:
-            chunk = buf[:seq_len+1]
-            buf = buf[seq_len:]
-            batch.append(torch.tensor(chunk))
-
-            if len(batch) == batch_size:
-                yield torch.stack(batch)
-                batch = []
-    
-
-
+running_loss = 0.0
 t0 = time.perf_counter()
-for micro_step, batch in enumerate(get_batch(stream)):
+for micro_step, batch in enumerate(dataloader, start=resume_micro_step):
     if micro_step >= total_micro_steps: 
         break
     
-    batch = batch.to(device)
+    batch = batch.to(device, non_blocking=True)
     
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
         
-        logits = model(batch[:, :-1])
+        pre_logits = model(batch[:, :-1])
         targets = batch[:, 1:]
 
-        loss = F.cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1)) # https://docs.pytorch.org/docs/2.13/generated/torch.nn.functional.cross_entropy.html
+        loss = fused_ce(raw_model.lm_head.weight, pre_logits.reshape(-1, d_model), targets.reshape(-1))
         loss = loss / accumulation_steps
 
     loss.backward()
+    running_loss += loss.detach()
 
     if (micro_step + 1) % accumulation_steps == 0:
-        nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
+        grad_norm = nn.utils.clip_grad_norm_(raw_model.parameters(), 1.0)
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
 
         step = (micro_step + 1) // accumulation_steps
-        if step == total_steps: # step % 1000 == 0
-            storage.save_checkpoint(raw_model, optimizer, scheduler, step, repo_id)
+        if step % 250 == 0:
+            storage.save_checkpoint(raw_model, optimizer, scheduler, step, repo_id, dataloader)
         
         #prints
-        torch.cuda.synchronize()
         n_tokens = batch_size * seq_len
         dt = time.perf_counter() - t0
-        print(f"step {step} loss={loss.item()*accumulation_steps:.4f}  {dt:.2f}s {n_tokens*accumulation_steps / dt:.0f} tok/s")
+        step_loss = running_loss.item()
+        print(f"step {step} loss={step_loss:.4f}  grad_norm={grad_norm.item():.2f}  {dt:.2f}s {n_tokens*accumulation_steps / dt:.0f} tok/s")
+        running_loss = 0.0
         t0 = time.perf_counter()
-
 
 
 storage.save_final_model(raw_model, repo_id)
 storage.wait_for_uploads()
 
-
-#sampling
-test_tokens = torch.tensor(tokenizer.encode(["Hello, I'm a language model and"])).to(device)
-model.eval()
-with torch.no_grad():
-
-    for _ in range(5):
-
-        buffer = test_tokens
-
-        for _ in range(10):
-            test_logits = model(buffer)
-            last_logits = test_logits[:, -1, :]
-            probs = F.softmax(last_logits, dim=-1)
-
-            idx_next = torch.multinomial(probs, num_samples=1)
-            output_tokens = tokenizer.decode(idx_next)
-            
-            buffer = torch.cat([buffer, idx_next], dim=1)
-
-        print(tokenizer.decode(buffer[0]))
-
-
-
-
-
-#TO DO
-#exact weight_decay + exact lr
-#ddp/FSDP if needed
-#gqa
-#loading weights
