@@ -32,7 +32,7 @@ def _clean():
             pass
 
 
-def save_checkpoint(raw_model, optimizer, scheduler, step, repo_id, loader):
+def save_checkpoint(raw_model, optimizer, scheduler, step, repo_id):
     file_name = f"checkpoint_{step}.pt"
     tmp = file_name + ".tmp"
     
@@ -42,7 +42,6 @@ def save_checkpoint(raw_model, optimizer, scheduler, step, repo_id, loader):
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'step': step,
-        'loader_state': loader.state_dict()
     }
     
     torch.save(checkpoint, tmp)
